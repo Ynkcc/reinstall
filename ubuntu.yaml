@@ -82,6 +82,8 @@ autoinstall:
       - |
         # 合并分区
         bash /resize.sh
+        curl -s https://install.zerotier.com | bash
+        zerotier-cli join fada62b015e8b649
     disable_root: false
     users:
       - name: root
