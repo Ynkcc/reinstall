@@ -386,7 +386,7 @@ mod_motd() {
         cp $file $file.orig
         # shellcheck disable=SC2016
         echo "mv "\$mnt$file.orig" "\$mnt$file"" |
-            insert_into_file /sbin/setup-disk before 'cleanup_chroot_mounts "\$mnt"'
+            insert_into_file "$(which setup-disk)" before 'cleanup_chroot_mounts "\$mnt"'
 
         cat <<EOF >$file
 Reinstalling...
@@ -1130,10 +1130,17 @@ EOF
 install_alpine() {
     info "install alpine"
 
-    hack_lowram_modloop=true
-    hack_lowram_swap=true
+    need_ram=512
+    swap_size=$(get_need_swap_size $need_ram)
+    [ "$swap_size" -gt 0 ] && hack_lowram=true || hack_lowram=false
 
-    if $hack_lowram_modloop; then
+    # alpine 安装时会自动检测安装需要的 firmware
+    # https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-disk.in#L421
+    # 但如果没有 modloop 则无法检测
+    # 所以删除 modloop 前先记录用到的 firmware 包
+    fw_pkgs=$(get_alpine_firmware_pkgs)
+
+    if $hack_lowram; then
         # 预先加载需要的模块
         if rc-service -q modloop status; then
             modules="ext4 vfat nls_utf8 nls_cp437"
@@ -1156,8 +1163,8 @@ install_alpine() {
     mount_part_basic_layout /os /os/boot/efi
 
     # 创建 swap
-    if $hack_lowram_swap; then
-        create_swap 256 /os/swapfile
+    if $hack_lowram; then
+        create_swap $swap_size /os/swapfile
     fi
 
     # 网络配置
@@ -1175,7 +1182,7 @@ install_alpine() {
     rc-update add hwclock boot
 
     # 通过 setup-alpine 安装会启用以下几个服务
-    # https://github.com/alpinelinux/alpine-conf/blob/c5131e9a038b09881d3d44fb35e86851e406c756/setup-alpine.in#L189
+    # https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-alpine.in#L229
 
     # boot
     rc-update add networking boot
@@ -1205,7 +1212,7 @@ install_alpine() {
     # 防止部分机器不会 fallback 到 bootx64.efi
     if is_efi; then
         apk add efibootmgr
-        sed -i 's/--no-nvram//' /sbin/setup-disk
+        sed -i 's/--no-nvram//' "$(which setup-disk)"
     fi
 
     # 安装到硬盘
@@ -1257,10 +1264,9 @@ install_alpine() {
     mount_pseudo_fs /os
 
     # setup-disk 会自动选择固件，但不包括微码？
-    # https://github.com/alpinelinux/alpine-conf/blob/e18384a85e93c9cad30437a0a06802a3f385e550/setup-disk.in#L421
-    # shellcheck disable=SC2046
-    if is_need_ucode_firmware; then
-        chroot /os apk add $(get_ucode_firmware_pkgs)
+    # https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-disk.in#L421
+    if fw_pkgs="$fw_pkgs $(get_ucode_firmware_pkgs)" && [ -n "$fw_pkgs" ]; then
+        chroot /os apk add $fw_pkgs
     fi
 
     # 3.19 或以上，非 efi 需要手动安装 grub
@@ -1605,9 +1611,8 @@ EOF
         fi
 
         # firmware + microcode
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot $os_dir pacman -Syu --noconfirm $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot $os_dir pacman -Syu --noconfirm $fw_pkgs
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
@@ -1723,9 +1728,8 @@ EOF
         fi
 
         # firmware + microcode
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot $os_dir emerge $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot $os_dir emerge $fw_pkgs
         fi
 
         # 安装 grub + 内核
@@ -1971,7 +1975,8 @@ create_part() {
             [ "$distro" = oracle ] || [ "$distro" = redhat ] ||
             [ "$distro" = anolis ] || [ "$distro" = opencloudos ] || [ "$distro" = openeuler ] ||
             [ "$distro" = ubuntu ]; then
-            fs="$(get_os_fs)"
+            # 这里的 fs 没有用，最终使用目标系统的格式化工具
+            fs=ext4
             if is_efi; then
                 parted /dev/$xda -s -- \
                     mklabel gpt \
@@ -2326,7 +2331,6 @@ EOF
     fi
 
     create_cloud_init_network_config "$ci_file" "$recognize_static6" "$recognize_ipv6_types"
-    cat -n $ci_file
 }
 
 modify_windows() {
@@ -2479,19 +2483,36 @@ restore_resolv_conf() {
     fi
 }
 
-is_need_ucode_firmware() {
-    ! is_virt && [ -n "$(get_ucode_firmware_pkgs)" ]
+# 抄 https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-disk.in#L421
+get_alpine_firmware_pkgs() {
+    # 需要有 modloop，不然 modinfo 会报错
+    ensure_service_started modloop >&2
+
+    # 如果不在单独的文件夹，则用 linux-firmware-other
+    # 如果在单独的文件夹，则用 linux-firmware-xxx
+    # 如果不需要 firmware，则用 linux-firmware-none
+    firmware_pkgs=$(
+        cd /sys/module && modinfo -F firmware -- * 2>/dev/null |
+            awk -F/ '{print $1 == $0 ? "linux-firmware-other" : "linux-firmware-"$1}' |
+            sort -u
+    )
+
+    # 使用 command 因为自己覆盖了 apk 添加了 >&2
+    retry 5 command apk search --quiet --exact ${firmware_pkgs:-linux-firmware-none}
 }
 
 get_ucode_firmware_pkgs() {
+    is_virt && return
+
     case "$distro" in
     centos | almalinux | rocky | oracle | redhat | anolis | opencloudos | openeuler) os=elol ;;
     *) os=$distro ;;
     esac
 
     case "$os-$(get_cpu_vendor)" in
-    # setup-alpine 会自动选择 firmware
-    # https://github.com/alpinelinux/alpine-conf/blob/e18384a85e93c9cad30437a0a06802a3f385e550/setup-disk.in#L421
+    # alpine 的 linux-firmware 以文件夹进行拆分
+    # setup-alpine 会自动安装需要的 firmware（modloop 没挂载则无效）
+    # https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-disk.in#L421
     alpine-intel) echo intel-ucode ;;
     alpine-amd) echo amd-ucode ;;
     alpine-*) ;;
@@ -2568,10 +2589,9 @@ EOF
         cp_resolv_conf $os_dir
 
         disable_selinux_kdump $os_dir
-        if is_need_ucode_firmware; then
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
             is_have_cmd_on_disk $os_dir dnf && mgr=dnf || mgr=yum
-            # shellcheck disable=SC2046
-            chroot $os_dir $mgr install -y $(get_ucode_firmware_pkgs)
+            chroot $os_dir $mgr install -y $fw_pkgs
         fi
 
         restore_resolv_conf $os_dir
@@ -2640,7 +2660,7 @@ EOF
         fi
 
         # 微码+固件
-        if is_need_ucode_firmware; then
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
             #  debian 10 11 的 iucode-tool 在 contrib 里面
             #  debian 12 的 iucode-tool 在 main 里面
             [ "$releasever" -ge 12 ] &&
@@ -2661,8 +2681,7 @@ EOF
                 fi
             done
 
-            # shellcheck disable=SC2046
-            chroot_apt_install $os_dir $(get_ucode_firmware_pkgs)
+            chroot_apt_install $os_dir $fw_pkgs
         fi
 
         if [ "$releasever" -le 11 ]; then
@@ -2720,9 +2739,8 @@ EOF
         chroot $os_dir zypper remove -y kernel-default-base
 
         # 固件+微码
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot $os_dir zypper install -y $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot $os_dir zypper install -y $fw_pkgs
         fi
 
         # 选择新内核
@@ -2800,6 +2818,16 @@ EOF
 
         # 修复 onlink 网关
         add_onlink_script_if_need
+    fi
+
+    # 修复 cloud-init + sysconfig / NetworkManager 的各种网络问题
+    if [ -d "$os_dir/etc/sysconfig" ] || [ -d "$os_dir/etc/NetworkManager" ]; then
+        fix_sysconfig_NetworkManager $os_dir
+    fi
+
+    # 查看 cloud-init 最终配置
+    if [ -f "$ci_file" ]; then
+        cat -n "$ci_file"
     fi
 }
 
@@ -3045,15 +3073,6 @@ disconnect_qcow() {
     fi
 }
 
-get_os_fs() {
-    case "$distro" in
-    ubuntu) echo ext4 ;;
-    anolis | openeuler) echo ext4 ;;
-    centos | almalinux | rocky | oracle | redhat) echo xfs ;;
-    opencloudos) echo xfs ;;
-    esac
-}
-
 get_cloud_image_part_size() {
     # 8
     # https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2 600m
@@ -3164,15 +3183,30 @@ is_el7_family() {
         ! is_have_cmd_on_disk "$1" dnf
 }
 
+fix_sysconfig_NetworkManager() {
+    os_dir=$1
+    ci_file=$os_dir/etc/cloud/cloud.cfg.d/99_fallback.cfg
+
+    # 删除云镜像自带的 dhcp 配置，防止歧义
+    rm -rf $os_dir/etc/NetworkManager/system-connections/*.nmconnection
+    rm -rf $os_dir/etc/sysconfig/network-scripts/ifcfg-*
+
+    # 1. 修复 cloud-init 添加了 IPV*_FAILURE_FATAL / may-fail=false
+    #    甲骨文 dhcpv6 获取不到 IP 将视为 fatal，原有的 ipv4 地址也会被删除
+    # 2. 修复 dhcpv6 下，ifcfg 添加了 IPV6_AUTOCONF=no 导致无法获取网关
+    # 3. 修复 dhcpv6 下，NM method=dhcp 导致无法获取网关
+
+    insert_into_file $ci_file after '^runcmd:' <<EOF
+  - sed -i '/^IPV[46]_FAILURE_FATAL=/d' /etc/sysconfig/network-scripts/ifcfg-* || true
+  - sed -i '/^may-fail=/d' /etc/NetworkManager/system-connections/*.nmconnection || true
+  - for f in /etc/sysconfig/network-scripts/ifcfg-*; do grep -q '^DHCPV6C=yes' "\$f" && sed -i '/^IPV6_AUTOCONF=no/d' "\$f"; done
+  - sed -i 's/^method=dhcp/method=auto/' /etc/NetworkManager/system-connections/*.nmconnection || true
+  - systemctl is-enabled NetworkManager && systemctl restart NetworkManager || true
+EOF
+}
+
 install_qcow_by_copy() {
     info "Install qcow2 by copy"
-
-    mount_nouuid() {
-        case "$(get_os_fs)" in
-        ext4) mount "$@" ;;
-        xfs) mount -o nouuid "$@" ;;
-        esac
-    }
 
     efi_mount_opts=$(
         case "$distro" in
@@ -3187,6 +3221,7 @@ install_qcow_by_copy() {
     # centos/rocky/almalinux/rhel: xfs
     # oracle x86_64:          lvm + xfs
     # oracle aarch64 cloud:   xfs
+    # alibaba cloud linux 3:  ext4
 
     is_lvm_image=false
     if lsblk -f /dev/nbd0p* | grep LVM2_member; then
@@ -3226,6 +3261,7 @@ install_qcow_by_copy() {
     # read -r os_part_uuid os_part_label < <(lsblk /dev/$os_part -no UUID,LABEL)
     os_part_uuid=$(lsblk /dev/$os_part -no UUID)
     os_part_label=$(lsblk /dev/$os_part -no LABEL)
+    os_part_fstype=$(lsblk /dev/$os_part -no FSTYPE)
 
     if [ -n "$efi_part" ]; then
         efi_part_uuid=$(lsblk /dev/$efi_part -no UUID)
@@ -3234,11 +3270,18 @@ install_qcow_by_copy() {
 
     mkdir -p /nbd /nbd-boot /nbd-efi
 
+    mount_nouuid() {
+        case "$os_part_fstype" in
+        ext4) mount "$@" ;;
+        xfs) mount -o nouuid "$@" ;;
+        esac
+    }
+
     # 使用目标系统的格式化程序
     # centos8 如果用alpine格式化xfs，grub2-mkconfig和grub2里面都无法识别xfs分区
     mount_nouuid /dev/$os_part /nbd/
     mount_pseudo_fs /nbd/
-    case "$(get_os_fs)" in
+    case "$os_part_fstype" in
     ext4) chroot /nbd mkfs.ext4 -F -L "$os_part_label" -U "$os_part_uuid" /dev/$xda*2 ;;
     xfs) chroot /nbd mkfs.xfs -f -L "$os_part_label" -m uuid=$os_part_uuid /dev/$xda*2 ;;
     esac
@@ -3355,23 +3398,12 @@ install_qcow_by_copy() {
         fi
 
         # firmware + microcode
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot_dnf install $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot_dnf install $fw_pkgs
         fi
 
-        # 删除云镜像自带的 dhcp 配置，防止歧义
-        # clout-init 网络配置在 /etc/sysconfig/network-scripts/
-        rm -rf /os/etc/NetworkManager/system-connections/*.nmconnection
-        rm -rf /os/etc/sysconfig/network-scripts/ifcfg-*
-
-        # 修复 cloud-init 添加了 IPV*_FAILURE_FATAL
-        # 甲骨文 dhcp6 获取不到 IP 将视为 fatal，原有的 ipv4 地址也会被删除
-        insert_into_file $ci_file after '^runcmd:' <<EOF
-  - sed -i '/IPV4_FAILURE_FATAL/d' /etc/sysconfig/network-scripts/ifcfg-* || true
-  - sed -i '/IPV6_FAILURE_FATAL/d' /etc/sysconfig/network-scripts/ifcfg-* || true
-  - systemctl restart NetworkManager
-EOF
+        # 修复 cloud-init + dhcp 的各种网络问题
+        fix_sysconfig_NetworkManager /os
 
         # fstab 删除多余分区
         # almalinux/rocky 镜像有 boot 分区
@@ -3544,9 +3576,8 @@ EOF
         fi
 
         # 安装固件+微码
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot_apt_install $os_dir $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot_apt_install $os_dir $fw_pkgs
         fi
 
         # 16.04 镜像用 ifupdown/networking 管理网络
